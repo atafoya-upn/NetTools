@@ -175,8 +175,8 @@ def get_ring_id():
         A valid ring ID string in the format AAAA-MOE-00.
     """
     # Define patterns:
-    moe_pattern = re.compile(r'^(?P<prefix>[A-Z]{4})-MOE-(?P<suffix>\d{2}(-P)?)$')
-    coe_pattern = re.compile(r'^(?P<prefix>[A-Z]{4})-COE-(?P<suffix>\d{2}(-P)?)$')
+    moe_pattern = re.compile(r"^(?P<prefix>[A-Z]{4})-MOE-(?P<suffix>\d{2}(-P)?)$")
+    coe_pattern = re.compile(r"^(?P<prefix>[A-Z]{4})-COE-(?P<suffix>\d{2}(-P)?)$")
     
     while True:
         ring_id_input = input("Enter the ring ID (format: AAAA-MOE-00): ").strip().upper()
@@ -265,6 +265,28 @@ def device_connect(ip, device_type):
     )
 
 
+def _get_ckids(connection):
+    """Gets CKIDs from the device."""
+
+    sh_run_cmd = "show run"
+    voice_cmd = r"show ip route vrf VOICE | i directly connected"
+
+    connection.send_command("terminal length 0")
+    running_cfg = connection.send_command(sh_run_cmd, read_timeout=60)
+    voice_check = connection.send_command(voice_cmd)
+
+    ckid_pattern = re.compile(r"([A-Z]{6}\w{2}[-/][A-Z]{3}\w{3}[-/][A-Z]{6}\w{2})")
+    voice_pattern = re.compile(r"(?:description.*)(WL.?[0-9]{5})")
+
+    ckids = ckid_pattern.findall(running_cfg)
+    updated_list = [s.replace("-", "/") for s in ckids]
+    circuit_ids = list(set(updated_list))
+    if 'directly connected' in voice_check:
+        circuit_ids.extend(voice_pattern.findall(running_cfg))
+
+    return circuit_ids
+
+
 def _xe_get_device_info(connection, ring_id, template_dir):
     """Gets device information for Cisco XE devices."""
 
@@ -292,24 +314,82 @@ def _xe_get_device_info(connection, ring_id, template_dir):
     return (h_name, outputs)
 
 
-def _xe_parse_device_info(outputs, ring_id):
-    """Parses device information for Cisco XE devices."""
+def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
+    """Parses device information for Cisco XE devices.
 
-    if_desc_out = outputs["interfaces"]
+    If collect_CKIDs is False, no service interface processing is done and the
+    returned service_ports list is empty, with all circuit flags set to False.
+    """
+    # Compile the regex for service descriptions
+    serv_des_re = re.compile(
+        r"(?P<aloc>[A-Z]{6}\w{2})/"
+        r"(?P<circuitid>[A-Z]{3}\w{3})/"
+        r"(?P<zloc>[A-Z]{6}\w{2})[-_]"
+        r"(?P<bandwidth>\d{1,5}M)[-_]"
+        r"(?P<actname>\S+)"
+    )
 
-    ring_ports = [
-        if_line["port"]
-        for if_line in if_desc_out
-        if ring_id in if_line["description"]
-    ]
+    # Initialize lists and flags
+    ring_ports = []
+    service_ports = []  # Will remain empty if collect_CKIDs is False
+    dia_circuit = False
+    epl_circuit = False
+    ela_circuit = False
+    voice_circuit = False
+
+    # Process each interface entry if it has a non-empty description.
+    for if_line in outputs["interfaces"]:
+        description = if_line.get("description", "")
+        if not description:
+            continue
+
+        # Skip management interfaces
+        if description == "MGT_UPS":
+            continue
+
+        # Check if the interface belongs to the ring
+        if ring_id in description:
+            ring_ports.append(if_line["port"])
+        else:
+            # If we're collecting CKIDs, process the service interface data.
+            if collect_CKIDs:
+                service_ports.append(if_line["port"])
+                match = serv_des_re.search(description)
+                if match:
+                    circuitid = match.group("circuitid")
+                    if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
+                        dia_circuit = True
+                    elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
+                        epl_circuit = True
+                    elif circuitid.startswith("ELA"):
+                        ela_circuit = True
+                else:
+                    # If the regex doesn't match, assume this is a voice service.
+                    voice_circuit = True
+
+    # Validate that exactly two ring ports were found.
     if len(ring_ports) != 2:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
+    # Retrieve additional device information.
     plat_out = outputs["platform"]
     chassis = plat_out[0]["chassis_type"]
+    firmware_version = plat_out[0]["firmware_version"]
     ver_out = outputs["version"]
     ios_ver = ver_out[0]["version"]
-    return chassis, ios_ver, plat_out[0]["firmware_version"], ring_ports
+
+    # Return all collected values.
+    return (
+        chassis,
+        ios_ver,
+        firmware_version,
+        ring_ports,
+        service_ports,
+        dia_circuit,
+        epl_circuit,
+        ela_circuit,
+        voice_circuit,
+    )
 
 
 def _xe_get_interface_info(connection, ring_ports):
@@ -363,7 +443,14 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         connection.establish_connection()
 
         h_name, outputs = _xe_get_device_info(connection, ring_id, template_dir)
-        chassis, ios_ver, rom_version, ring_ports = _xe_parse_device_info(outputs, ring_id)
+        chassis, ios_ver, rom_version, ring_ports, service_ports, \
+            dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
+                _xe_parse_device_info(outputs, ring_id, collect_CKIDs)
+        print(f"Service Ports: {service_ports}")
+        print(f"DIA: {dia_circuit}")
+        print(f"EPL: {epl_circuit}")
+        print(f"ELA: {ela_circuit}")
+        print(f"Voice: {voice_circuit}")
         router_id, if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xe_parse_interface_info(*_xe_get_interface_info(connection, ring_ports))
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
@@ -415,13 +502,21 @@ def _xr_get_device_info(connection, ring_id, template_dir):
     return (h_name, dev_id_out, platform, version, if_desc_output)
 
 
-def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id):
+def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id, collect_CKIDs=True):
     """Parses device information for Cisco XR devices."""
 
     # Define and compile regex patterns
     chassis_pattern = re.compile(r"(N540X?-[A26][C8Z][CZ1][48]?[CG]?-SYS-?[AD]?)")
     version_pattern = re.compile(r"(?:\s+Version\s+\:\s)(\d\.\d\.\d)")
     ip_regex = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
+    # Compile the regex for service descriptions
+    serv_des_re = re.compile(
+        r"(?P<aloc>[A-Z]{6}\w{2})/"
+        r"(?P<circuitid>[A-Z]{3}\w{3})/"
+        r"(?P<zloc>[A-Z]{6}\w{2})[-_]"
+        r"(?P<bandwidth>\d{1,5}M)[-_]"
+        r"(?P<actname>\S+)"
+    )
 
     # Parse device information
     dev_id_match = ip_regex.findall(dev_id_out)
@@ -432,15 +527,49 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
     chassis = chassis_pattern.search(platform)[1]
     ios_ver = version_pattern.search(version)[1]
 
-    ring_ports = [
-        if_line["interface"]
-        for if_line in if_desc_output
-        if ring_id in if_line["description"]
-    ]
+    # Initialize lists and flags
+    ring_ports = []
+    service_ports = []  # Will remain empty if collect_CKIDs is False
+    dia_circuit = False
+    epl_circuit = False
+    ela_circuit = False
+    voice_circuit = False
+
+    # Process each interface entry if it has a non-empty description.
+    for if_line in if_desc_output:
+        description = if_line.get("description", "")
+        if not description:
+            continue
+
+        # Skip management interfaces
+        if description == "MGT_UPS":
+            continue
+
+        # Check if the interface belongs to the ring
+        if ring_id in description:
+            ring_ports.append(if_line["interface"])
+        else:
+            # If we're collecting CKIDs, process the service interface data.
+            if collect_CKIDs:
+                service_ports.append(if_line["interface"])
+                match = serv_des_re.search(description)
+                if match:
+                    circuitid = match.group("circuitid")
+                    if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
+                        dia_circuit = True
+                    elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
+                        epl_circuit = True
+                    elif circuitid.startswith("ELA"):
+                        ela_circuit = True
+                else:
+                    # If the regex doesn't match, assume this is a voice service.
+                    voice_circuit = True
+
+    # Validate that exactly two ring ports were found.
     if len(ring_ports) != 2:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
-    return (dev_id_match[0], chassis, ios_ver, ring_ports)
+    return (dev_id_match[0], chassis, ios_ver, ring_ports, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
 
 
 def _xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd):
@@ -479,28 +608,6 @@ def _xr_parse_interface_info(if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
     return (if1_ip[0], if1_neighbor[0], if2_ip[0], if2_neighbor[0])
 
 
-def _get_ckids(connection):
-    """Gets CKIDs from the device."""
-
-    sh_run_cmd = "show run"
-    voice_cmd = r"show ip route vrf VOICE | i directly connected"
-
-    connection.send_command("terminal length 0")
-    running_cfg = connection.send_command(sh_run_cmd, read_timeout=60)
-    voice_check = connection.send_command(voice_cmd)
-
-    ckid_pattern = re.compile(r"([A-Z]{6}\w{2}[-/][A-Z]{3}\w{3}[-/][A-Z]{6}\w{2})")
-    voice_pattern = re.compile(r"(?:description.*)(WL.?[0-9]{5})")
-
-    ckids = ckid_pattern.findall(running_cfg)
-    updated_list = [s.replace("-", "/") for s in ckids]
-    circuit_ids = list(set(updated_list))
-    if 'directly connected' in voice_check:
-        circuit_ids.extend(voice_pattern.findall(running_cfg))
-
-    return circuit_ids
-
-
 def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
     """Gets device information for Cisco XR devices."""
 
@@ -513,8 +620,15 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         h_name, dev_id_out, platform, version, if_desc_output = \
             _xr_get_device_info(connection, ring_id, template_dir)
 
-        router_id, chassis, ios_ver, ring_ports = \
-            _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id)
+        router_id, chassis, ios_ver, ring_ports, service_ports, \
+            dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
+            _xr_parse_device_info(dev_id_out, platform, version, \
+                if_desc_output, ring_id, collect_CKIDs)
+        print(f"Service Ports: {service_ports}")
+        print(f"DIA: {dia_circuit}")
+        print(f"EPL: {epl_circuit}")
+        print(f"ELA: {ela_circuit}")
+        print(f"Voice: {voice_circuit}")
 
         if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xr_parse_interface_info(*_xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd))
@@ -653,7 +767,7 @@ def print_device_info(device_info):
 def save_data(save_directory, ring_id, all_dev_info, ckid_full_list):
     """Saves the collected data to files."""
 
-    print(f"Creating saving files to: {save_directory}")
+    print(f"Creating and saving files to: {save_directory}")
     dev_file_path = save_directory / Path(f"Dev_Info_{ring_id}.json")
     ckid_file_path = save_directory / Path(f"CKIDs_{ring_id}.txt")
 
