@@ -922,8 +922,8 @@ def save_data(save_directory, ring_id, all_dev_info, ckid_full_list):
     """Saves the collected data to files."""
 
     print(f"Creating and saving files to: {save_directory}")
-    dev_file_path = save_directory / Path(f"Dev_Info_{ring_id}.json")
-    ckid_file_path = save_directory / Path(f"CKIDs_{ring_id}.txt")
+    dev_file_path = save_directory / Path(f"{ring_id}_Dev_Info.json")
+    ckid_file_path = save_directory / Path(f"{ring_id}_CKIDs.txt")
 
     with dev_file_path.open('w') as f:
         json.dump(all_dev_info, f, indent=4)
