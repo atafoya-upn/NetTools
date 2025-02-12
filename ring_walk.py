@@ -367,8 +367,8 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
                     # If the regex doesn't match, assume this is a voice service.
                     voice_circuit = True
 
-    # Validate that exactly two ring ports were found.
-    if len(ring_ports) != 2:
+    # Validate that at least one ring port was found.
+    if len(ring_ports) < 1:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
     # Retrieve additional device information.
@@ -392,19 +392,98 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
     )
 
 
+def _xe_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
+
+    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
+    
+    interface_configs = []
+    p_map_list = []
+    p_map_configs = []
+    l2vpn_configs = []
+    cfm_configs = []
+    voice_vrf = []
+    voice_bgp = []
+    service_configs = "!\n"
+    
+    for port in service_ports:
+        if_config = connection.send_command(f"show run interface {port}")
+        p_map_list.extend(p_map_re.findall(if_config))
+        if_conf_split = if_config.splitlines()[3:-1]
+        interface_configs.extend(if_conf_split)
+    for p_map in p_map_list:
+        p_map_out = connection.send_command(f"show run policy-map {p_map}")
+        p_map_split = p_map_out.splitlines()[3:-1]
+        p_map_configs.extend(p_map_split)
+    if epl_circuit:
+        cfm_out = connection.send_command("show run | s ethernet cfm")
+        cfm_split = cfm_out.splitlines()
+        evc_out = connection.send_command("show run | i ethernet evc")
+        evc_split = evc_out.splitlines()
+        cfm_configs.extend(cfm_split)
+        cfm_configs.extend(evc_split)
+    if ela_circuit:
+        bd_re = re.compile(r"\s*(\d+)\s+")
+        vfi_re = re.compile(r"member\s+vfi\s+([A-Za-z0-9_-]+)")
+        for port in service_ports:
+            port_desc = connection.send_command(f"show interface {port} description")
+            if "ELA" in port_desc:
+                port_conf = connection.send_command(f"show bridge-domain | i {port}")
+                bd_number_search = bd_re.search(port_conf)
+                if bd_number_search:
+                    bd_number = bd_number_search.group(1)
+                bridge_dom_output = connection.send_command(
+                    f"show run | s bridge-domain {bd_number}"
+                    )
+                vfi_name_match = vfi_re.search(bridge_dom_output)
+                vfi_name = vfi_name_match.group(1)
+                vfi_out = connection.send_command(
+                        f"show run | s l2vpn vfi context {vfi_name}"
+                    )
+                bd_split = bridge_dom_output.splitlines()
+                vfi_split = vfi_out.splitlines()
+                l2vpn_configs.extend(vfi_split)
+                l2vpn_configs.extend(bd_split)
+
+    if voice_circuit:
+        vrf_out = connection.send_command("show run | s ip vrf VOICE")
+        vrf_split = vrf_out.splitlines()
+        voice_vrf.extend(vrf_split)
+        bgp_out1 = connection.send_command("sh run vrf VOICE | s router bgp")
+        bgp_out = f"!\n{bgp_out1}"
+        bgp_split = bgp_out.splitlines()
+        voice_bgp.extend(bgp_split)
+    
+    for line in voice_vrf:
+        service_configs += f"{line}\n"
+    for line in cfm_configs:
+        service_configs += f"{line}\n"
+    for line in l2vpn_configs:
+        service_configs += f"{line}\n"
+    for line in p_map_configs:
+        service_configs += f"{line}\n"
+    for line in interface_configs:
+        service_configs += f"{line}\n"
+    for line in voice_bgp:
+        service_configs += f"{line}\n"
+
+    return service_configs
+
 def _xe_get_interface_info(connection, ring_ports):
     """Gets interface information for Cisco XE devices."""
-
-    ring_if1 = ring_ports[0]
-    ring_if2 = ring_ports[1]
 
     ip_if_cmd = "show ip interface brief"
     ospf_ne_cmd = "show ip ospf neighbor"
 
+    ring_if1 = ring_ports[0]
     if_ip_out1 = connection.send_command(f"{ip_if_cmd} {ring_if1}")
     ospf_ne_out1 = connection.send_command(f"{ospf_ne_cmd} {ring_if1}")
-    if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2}")
-    ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
+    if len(ring_ports) != 2:
+        if_ip_out2 = None
+        ospf_ne_out2 = None
+    else:
+        ring_if2 = ring_ports[1]
+        if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2}")
+        ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
     dev_id_out = connection.send_command(f"{ip_if_cmd} Lo0")
 
     return (dev_id_out, if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
@@ -419,21 +498,16 @@ def _xe_parse_interface_info(dev_id_out, if_ip_out1, ospf_ne_out1, if_ip_out2, o
     if len(dev_id_match) != 1:
         raise ValueError("Invalid router ID output.")
 
-    if1_ip = ip_regex.findall(if_ip_out1)
-    if len(if1_ip) != 1:
-        raise ValueError("Invalid interface 1 IP output.")
-    if1_neighbor = ip_regex.findall(ospf_ne_out1)
-    if len(if1_neighbor) != 2:
-        raise ValueError("Invalid interface 1 neighbor output.")
+    if1_ip = ip_regex.findall(if_ip_out1)[0]
+    if1_neighbor = ip_regex.findall(ospf_ne_out1)[0]
+    if if_ip_out2:
+        if2_ip = ip_regex.findall(if_ip_out2)[0]
+        if2_neighbor = ip_regex.findall(ospf_ne_out2)[0]
+    else:
+        if2_ip = None
+        if2_neighbor = None
 
-    if2_ip = ip_regex.findall(if_ip_out2)
-    if len(if2_ip) != 1:
-        raise ValueError("Invalid interface 2 IP output.")
-    if2_neighbor = ip_regex.findall(ospf_ne_out2)
-    if len(if2_neighbor) != 2:
-        raise ValueError("Invalid interface 2 neighbor output.")
-
-    return (dev_id_match[0], if1_ip[0], if1_neighbor[0], if2_ip[0], if2_neighbor[0])
+    return (dev_id_match[0], if1_ip, if1_neighbor, if2_ip, if2_neighbor)
 
 
 def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
@@ -446,16 +520,18 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         chassis, ios_ver, rom_version, ring_ports, service_ports, \
             dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
                 _xe_parse_device_info(outputs, ring_id, collect_CKIDs)
-        print(f"Service Ports: {service_ports}")
-        print(f"DIA: {dia_circuit}")
-        print(f"EPL: {epl_circuit}")
-        print(f"ELA: {ela_circuit}")
-        print(f"Voice: {voice_circuit}")
         router_id, if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xe_parse_interface_info(*_xe_get_interface_info(connection, ring_ports))
+        service_configs = _xe_get_service_conf(connection, service_ports, \
+            dia_circuit, epl_circuit, ela_circuit, voice_circuit)
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
 
         connection.disconnect()
+
+        if len(ring_ports) != 2:
+            ring_port2 = None
+        else:
+            ring_port2 = ring_ports[1]
 
         return {
             "hostname": h_name,
@@ -469,10 +545,11 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
                 "neighbor": if1_neighbor,
             },
             "ring_if2": {
-                "if_id": ring_ports[1],
+                "if_id": ring_port2,
                 "if_ip": if2_ip,
                 "neighbor": if2_neighbor,
             },
+            "service_configs": service_configs,
             "ckid_list": circuit_ids,
         }
 
@@ -565,24 +642,102 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
                     # If the regex doesn't match, assume this is a voice service.
                     voice_circuit = True
 
-    # Validate that exactly two ring ports were found.
-    if len(ring_ports) != 2:
+    # Validate that no less than one ring port was found.
+    if len(ring_ports) < 1:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
     return (dev_id_match[0], chassis, ios_ver, ring_ports, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
+
+
+def _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
+    
+    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
+    
+    interface_configs = []
+    p_map_list = []
+    p_map_configs = []
+    l2vpn_configs = []
+    cfm_configs = []
+    voice_vrf = []
+    voice_bgp = []
+    service_configs = "!\n"
+    
+    for port in service_ports:
+        if_config = connection.send_command(f"show run interface {port}")
+        p_map_list.extend(p_map_re.findall(if_config))
+        if_conf_split = if_config.splitlines()
+        interface_configs.extend(if_conf_split[2:-1])
+    for p_map in p_map_list:
+        p_map_out = connection.send_command(f"show run policy-map {p_map}")
+        p_map_split = p_map_out.splitlines()
+        p_map_configs.extend(p_map_split[2:-1])
+    if dia_circuit:
+        l2vpn_out = connection.send_command("show run l2vpn xconnect group DIA")
+        l2vpn_split = l2vpn_out.splitlines()
+        l2vpn_configs.extend(l2vpn_split[2:-1])
+    if epl_circuit:
+        cfm_out = connection.send_command("show run ethernet cfm domain UPN_L3 level 3")
+        cfm_split = cfm_out.splitlines()
+        cfm_configs.extend(cfm_split[2:-1])
+        l2vpn_out = connection.send_command("show run l2vpn xconnect group EVPL")
+        if r"No such configuration item(s)" in l2vpn_out:
+            l2vpn_out = connection.send_command("show run l2vpn xconnect group EPL")
+        l2vpn_split = l2vpn_out.splitlines()
+        l2vpn_configs.extend(l2vpn_split[2:-1])
+    if ela_circuit:
+        bd_re = re.compile(r"(?:Bridge group:\s)(?<bgroup>[\w-_]+)(?:, bridge-domain: )(?<bdomain>[\w-_]+)")
+        for port in service_ports:
+            port_desc = connection.send_command(f"show interface {port} description")
+            if "ELA" in port_desc:
+                bridge_dom_output = connection.send_command(
+                    f"show l2vpn bridge-domain interface {port}"
+                    )
+                bridge_match = bd_re.search(bridge_dom_output)
+                bridge_group = bridge_match.group("bgroup")
+                bridge_dom = bridge_match.group("bdomain")
+                l2vpn_out = connection.send_command(
+                        f"show run l2vpn bridge group {bridge_group}"
+                    )
+                l2vpn_split = l2vpn_out.splitlines()
+                l2vpn_configs.extend(l2vpn_split[2:-1])
+    if voice_circuit:
+        vrf_out = connection.send_command("show run vrf VOICE")
+        vrf_split = vrf_out.splitlines()
+        voice_vrf.extend(vrf_split[2:-1])
+        bgp_out = connection.send_command("show run router bgp 15164 vrf VOICE")
+        bgp_split = bgp_out.splitlines()
+        voice_bgp.extend(bgp_split[2:-1])
+    
+    for line in voice_vrf:
+        service_configs += f"{line}\n"
+    for line in cfm_configs:
+        service_configs += f"{line}\n"
+    for line in p_map_configs:
+        service_configs += f"{line}\n"
+    for line in interface_configs:
+        service_configs += f"{line}\n"
+    for line in l2vpn_configs:
+        service_configs += f"{line}\n"
+    for line in voice_bgp:
+        service_configs += f"{line}\n"
+
+    return service_configs
 
 
 def _xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd):
     """Gets interface information for Cisco XR devices."""
 
     ring_if1 = ring_ports[0]
-    ring_if2 = ring_ports[1]
-
     if_ip_out1 = connection.send_command(f"{ip_if_cmd} {ring_if1} brief")
     ospf_ne_out1 = connection.send_command(f"{ospf_ne_cmd} {ring_if1}")
-    if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2} brief")
-    ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
-
+    if len(ring_ports) != 2:
+        if_ip_out2 = None
+        ospf_ne_out2 = None
+    else:
+        ring_if2 = ring_ports[1]
+        if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2} brief")
+        ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
+    
     return (if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
 
 
@@ -591,21 +746,17 @@ def _xr_parse_interface_info(if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
 
     ip_regex = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
 
-    if1_ip = ip_regex.findall(if_ip_out1)
-    if len(if1_ip) != 1:
-        raise ValueError("Invalid interface 1 IP output.")
-    if1_neighbor = ip_regex.findall(ospf_ne_out1)
-    if len(if1_neighbor) != 2:
-        raise ValueError("Invalid interface 1 neighbor output.")
+    if1_ip = ip_regex.findall(if_ip_out1)[0]
+    if1_neighbor = ip_regex.findall(ospf_ne_out1)[0]
+    
+    if if_ip_out2:
+        if2_ip = ip_regex.findall(if_ip_out2)[0]
+        if2_neighbor = ip_regex.findall(ospf_ne_out2)[0]
+    else:
+        if2_ip = None
+        if2_neighbor = None
 
-    if2_ip = ip_regex.findall(if_ip_out2)
-    if len(if2_ip) != 1:
-        raise ValueError("Invalid interface 2 IP output.")
-    if2_neighbor = ip_regex.findall(ospf_ne_out2)
-    if len(if2_neighbor) != 2:
-        raise ValueError("Invalid interface 2 neighbor output.")
-
-    return (if1_ip[0], if1_neighbor[0], if2_ip[0], if2_neighbor[0])
+    return (if1_ip, if1_neighbor, if2_ip, if2_neighbor)
 
 
 def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
@@ -624,11 +775,8 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
             dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
             _xr_parse_device_info(dev_id_out, platform, version, \
                 if_desc_output, ring_id, collect_CKIDs)
-        print(f"Service Ports: {service_ports}")
-        print(f"DIA: {dia_circuit}")
-        print(f"EPL: {epl_circuit}")
-        print(f"ELA: {ela_circuit}")
-        print(f"Voice: {voice_circuit}")
+        
+        service_configs = _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
 
         if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xr_parse_interface_info(*_xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd))
@@ -636,6 +784,11 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
 
         connection.disconnect()
+
+        if len(ring_ports) != 2:
+            ring_port2 = None
+        else:
+            ring_port2 = ring_ports[1]
 
         return {
             "hostname": h_name,
@@ -649,10 +802,11 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
                 "neighbor": if1_neighbor,
             },
             "ring_if2": {
-                "if_id": ring_ports[1],
+                "if_id": ring_port2,
                 "if_ip": if2_ip,
                 "neighbor": if2_neighbor,
             },
+            "service_configs": service_configs,
             "ckid_list": circuit_ids,
         }
 
