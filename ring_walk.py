@@ -282,12 +282,10 @@ def _get_ckids(connection):
     voice_pattern = re.compile(r"(?:description.*)(WL.?[0-9]{5})")
 
     ckids = ckid_pattern.findall(running_cfg)
-    updated_list = [s.replace("-", "/") for s in ckids]
-    circuit_ids = list(set(updated_list))
     if 'directly connected' in voice_check:
-        circuit_ids.extend(voice_pattern.findall(running_cfg))
-
-    return circuit_ids
+        ckids.extend(voice_pattern.findall(running_cfg))
+    updated_list = [s.replace("-", "/") for s in ckids]
+    return list(set(updated_list))
 
 
 def _xe_get_device_info(connection, ring_id, template_dir):
