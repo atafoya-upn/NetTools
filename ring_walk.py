@@ -62,6 +62,7 @@ from importlib.util import find_spec
 import json
 import tkinter as tk
 from tkinter import filedialog
+import pandas as pd
 
 if sys.version_info < (3, 9):
     sys.exit("This script requires Python 3.9 or higher!")
@@ -350,25 +351,22 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
         # Check if the interface belongs to the ring
         if ring_id in description:
             ring_ports.append(if_line["port"])
-        else:
-            # If we're collecting CKIDs, process the service interface data.
-            if collect_CKIDs:
-                service_ports.append(if_line["port"])
-                match = serv_des_re.search(description)
-                if match:
-                    circuitid = match.group("circuitid")
-                    if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
-                        dia_circuit = True
-                    elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
-                        epl_circuit = True
-                    elif circuitid.startswith("ELA"):
-                        ela_circuit = True
-                else:
-                    # If the regex doesn't match, assume this is a voice service.
-                    voice_circuit = True
+        elif collect_CKIDs:
+            service_ports.append(if_line["port"])
+            if match := serv_des_re.search(description):
+                circuitid = match["circuitid"]
+                if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
+                    dia_circuit = True
+                elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
+                    epl_circuit = True
+                elif circuitid.startswith("ELA"):
+                    ela_circuit = True
+            else:
+                # If the regex doesn't match, assume this is a voice service.
+                voice_circuit = True
 
     # Validate that at least one ring port was found.
-    if len(ring_ports) < 1:
+    if not ring_ports:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
     # Retrieve additional device information.
@@ -393,80 +391,101 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
 
 
 def _xe_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
+    """Gets service configurations for Cisco XE devices."""
 
-    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
-    
-    interface_configs = []
-    p_map_list = []
-    p_map_configs = []
-    l2vpn_configs = []
-    cfm_configs = []
-    voice_vrf = []
-    voice_bgp = []
     service_configs = "!\n"
-    
-    for port in service_ports:
-        if_config = connection.send_command(f"show run interface {port}")
-        p_map_list.extend(p_map_re.findall(if_config))
-        if_conf_split = if_config.splitlines()[3:-1]
-        interface_configs.extend(if_conf_split)
-    for p_map in p_map_list:
-        p_map_out = connection.send_command(f"show run policy-map {p_map}")
-        p_map_split = p_map_out.splitlines()[3:-1]
-        p_map_configs.extend(p_map_split)
-    if epl_circuit:
-        cfm_out = connection.send_command("show run | s ethernet cfm")
-        cfm_split = cfm_out.splitlines()
-        evc_out = connection.send_command("show run | i ethernet evc")
-        evc_split = evc_out.splitlines()
-        cfm_configs.extend(cfm_split)
-        cfm_configs.extend(evc_split)
-    if ela_circuit:
-        bd_re = re.compile(r"\s*(\d+)\s+")
-        vfi_re = re.compile(r"member\s+vfi\s+([A-Za-z0-9_-]+)")
-        for port in service_ports:
-            port_desc = connection.send_command(f"show interface {port} description")
-            if "ELA" in port_desc:
-                port_conf = connection.send_command(f"show bridge-domain | i {port}")
-                bd_number_search = bd_re.search(port_conf)
-                if bd_number_search:
-                    bd_number = bd_number_search.group(1)
-                bridge_dom_output = connection.send_command(
-                    f"show run | s bridge-domain {bd_number}"
-                    )
-                vfi_name_match = vfi_re.search(bridge_dom_output)
-                vfi_name = vfi_name_match.group(1)
-                vfi_out = connection.send_command(
-                        f"show run | s l2vpn vfi context {vfi_name}"
-                    )
-                bd_split = bridge_dom_output.splitlines()
-                vfi_split = vfi_out.splitlines()
-                l2vpn_configs.extend(vfi_split)
-                l2vpn_configs.extend(bd_split)
-
-    if voice_circuit:
-        vrf_out = connection.send_command("show run | s ip vrf VOICE")
-        vrf_split = vrf_out.splitlines()
-        voice_vrf.extend(vrf_split)
-        bgp_out1 = connection.send_command("sh run vrf VOICE | s router bgp")
-        bgp_out = f"!\n{bgp_out1}"
-        bgp_split = bgp_out.splitlines()
-        voice_bgp.extend(bgp_split)
-    
-    for line in voice_vrf:
-        service_configs += f"{line}\n"
-    for line in cfm_configs:
-        service_configs += f"{line}\n"
-    for line in l2vpn_configs:
-        service_configs += f"{line}\n"
-    for line in p_map_configs:
-        service_configs += f"{line}\n"
-    for line in interface_configs:
-        service_configs += f"{line}\n"
-    for line in voice_bgp:
-        service_configs += f"{line}\n"
+    service_configs += _xe_get_voice_configs(connection, voice_circuit)
+    service_configs += _xe_get_cfm_configs(connection, epl_circuit)
+    service_configs += _xe_get_l2vpn_configs(connection, ela_circuit, service_ports)
+    service_configs += _xe_get_interface_and_policy_map_configs(connection, service_ports)
 
     return service_configs
+
+
+def _xe_get_voice_configs(connection, voice_circuit):
+    """Gets voice-related configurations."""
+    if not voice_circuit:
+        return ""
+
+    vrf_out = connection.send_command("show run | s ip vrf VOICE").splitlines()
+    bgp_out = f"!\n{connection.send_command('sh run vrf VOICE | s router bgp')}"
+    bgp_split = bgp_out.splitlines()
+
+    voice_configs = "".join(f"{line}\n" for line in vrf_out)
+    for line in bgp_split:
+        voice_configs += f"{line}\n"
+
+    return voice_configs
+
+
+def _xe_get_cfm_configs(connection, epl_circuit):
+    """Gets CFM configurations."""
+
+    if not epl_circuit:
+        return ""
+
+    cfm_out = connection.send_command("show run | s ethernet cfm").splitlines()
+    evc_out = connection.send_command("show run | i ethernet evc").splitlines()
+
+    cfm_configs = "".join(f"{line}\n" for line in cfm_out)
+    for line in evc_out:
+        cfm_configs += f"{line}\n"
+    return cfm_configs
+
+
+def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
+    """Gets L2VPN configurations."""
+
+    if not ela_circuit:
+        return ""
+
+    l2vpn_configs = ""
+    bd_re = re.compile(r"\s*(\d+)\s+")
+    vfi_re = re.compile(r"member\s+vfi\s+([A-Za-z0-9_-]+)")
+
+    for port in service_ports:
+        port_desc = connection.send_command(f"show interface {port} description")
+        if "ELA" in port_desc:
+            port_conf = connection.send_command(f"show bridge-domain | i {port}")
+            if bd_number_search := bd_re.search(port_conf):
+                bd_number = bd_number_search[1]
+            bridge_dom_output = connection.send_command(
+                f"show run | s bridge-domain {bd_number}"
+            ).splitlines()
+            if vfi_name_match := vfi_re.search("\n".join(bridge_dom_output)):
+                vfi_name = vfi_name_match[1]
+                vfi_out = connection.send_command(
+                    f"show run | s l2vpn vfi context {vfi_name}"
+                ).splitlines()
+
+                for line in vfi_out:
+                    l2vpn_configs += f"{line}\n"
+                for line in bridge_dom_output:
+                    l2vpn_configs += f"{line}\n"
+
+    return l2vpn_configs
+
+
+def _xe_get_interface_and_policy_map_configs(connection, service_ports):
+    """Gets interface and policy map configurations."""
+
+    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
+    configs = ""
+    if_configs = ""
+    p_map_configs = ""
+
+    for port in service_ports:
+        if_config = connection.send_command(f"show run interface {port}")
+        if_conf_split = if_config.splitlines()[3:-1]
+        for line in if_conf_split:
+            if_configs += f"{line}\n"
+        for p_map in p_map_re.findall(if_config):
+            p_map_out = connection.send_command(f"show run policy-map {p_map}")
+            p_map_split = p_map_out.splitlines()[3:-1]
+            for line in p_map_split:
+                p_map_configs += f"{line}\n"
+        
+    return p_map_configs + if_configs
 
 def _xe_get_interface_info(connection, ring_ports):
     """Gets interface information for Cisco XE devices."""
@@ -528,11 +547,7 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
 
         connection.disconnect()
 
-        if len(ring_ports) != 2:
-            ring_port2 = None
-        else:
-            ring_port2 = ring_ports[1]
-
+        ring_port2 = None if len(ring_ports) != 2 else ring_ports[1]
         return {
             "hostname": h_name,
             "router_id": router_id,
@@ -584,7 +599,7 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
 
     # Define and compile regex patterns
     chassis_pattern = re.compile(r"(N540X?-[A26][C8Z][CZ1][48]?[CG]?-SYS-?[AD]?)")
-    version_pattern = re.compile(r"(?:\s+Version\s+\:\s)(\d\.\d\.\d)")
+    version_pattern = re.compile(r"(?:\s+Version\s+\:\s)(\d\.\d\.\d+)")
     ip_regex = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
     # Compile the regex for service descriptions
     serv_des_re = re.compile(
@@ -625,65 +640,71 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
         # Check if the interface belongs to the ring
         if ring_id in description:
             ring_ports.append(if_line["interface"])
-        else:
-            # If we're collecting CKIDs, process the service interface data.
-            if collect_CKIDs:
-                service_ports.append(if_line["interface"])
-                match = serv_des_re.search(description)
-                if match:
-                    circuitid = match.group("circuitid")
-                    if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
-                        dia_circuit = True
-                    elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
-                        epl_circuit = True
-                    elif circuitid.startswith("ELA"):
-                        ela_circuit = True
-                else:
-                    # If the regex doesn't match, assume this is a voice service.
-                    voice_circuit = True
+        elif collect_CKIDs:
+            service_ports.append(if_line["interface"])
+            if match := serv_des_re.search(description):
+                circuitid = match["circuitid"]
+                if circuitid.startswith("EIA") or circuitid.startswith("DIA"):
+                    dia_circuit = True
+                elif any(circuitid.startswith(x) for x in ["EPL", "EPH", "UNP", "EVC"]):
+                    epl_circuit = True
+                elif circuitid.startswith("ELA"):
+                    ela_circuit = True
+            else:
+                # If the regex doesn't match, assume this is a voice service.
+                voice_circuit = True
 
     # Validate that no less than one ring port was found.
-    if len(ring_ports) < 1:
+    if not ring_ports:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
 
     return (dev_id_match[0], chassis, ios_ver, ring_ports, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
 
 
 def _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
-    
-    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
-    
-    interface_configs = []
-    p_map_list = []
-    p_map_configs = []
-    l2vpn_configs = []
-    cfm_configs = []
-    voice_vrf = []
-    voice_bgp = []
+    """Gets service configurations for Cisco XR devices."""
+
     service_configs = "!\n"
-    
+    service_configs += _xr_get_cfm_configs(connection, epl_circuit)
+    service_configs += _xr_get_interface_and_policy_map_configs(connection, service_ports)
+    service_configs += _xr_get_l2vpn_configs(connection, dia_circuit, epl_circuit, ela_circuit, service_ports)
+    service_configs += _xr_get_voice_configs(connection, voice_circuit)
+
+    return service_configs
+
+
+def _xr_get_interface_and_policy_map_configs(connection, service_ports):
+    """Gets policy-map configurations."""
+
+    p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
+    p_map_configs = ""
+    interface_configs = ""
+
     for port in service_ports:
         if_config = connection.send_command(f"show run interface {port}")
-        p_map_list.extend(p_map_re.findall(if_config))
-        if_conf_split = if_config.splitlines()
-        interface_configs.extend(if_conf_split[2:-1])
-    for p_map in p_map_list:
-        p_map_out = connection.send_command(f"show run policy-map {p_map}")
-        p_map_split = p_map_out.splitlines()
-        p_map_configs.extend(p_map_split[2:-1])
+        for p_map in p_map_re.findall(if_config):
+            p_map_out = connection.send_command(f"show run policy-map {p_map}").splitlines()[2:-1]
+            for line in p_map_out:
+                p_map_configs += f"{line}\n"
+            for line in if_config.splitlines()[2:-1]:
+                interface_configs += f"{line}\n"
+
+    return p_map_configs + interface_configs
+
+
+def _xr_get_l2vpn_configs(connection, dia_circuit, epl_circuit, ela_circuit, service_ports):
+    """Gets L2VPN configurations."""
+
+    l2vpn_configs = ""
+
     if dia_circuit:
-        l2vpn_out = connection.send_command("show run l2vpn xconnect group DIA")
-        l2vpn_split = l2vpn_out.splitlines()
-        l2vpn_configs.extend(l2vpn_split[2:-1])
+        l2vpn_configs += _get_xr_config_section(connection, "show run l2vpn xconnect group DIA")
     if epl_circuit:
-        cfm_out = connection.send_command("show run ethernet cfm domain UPN_L3 level 3")
-        cfm_split = cfm_out.splitlines()
-        cfm_configs.extend(cfm_split[2:-1])
         l2vpn_out = connection.send_command("show run l2vpn xconnect group EVPL")
         if r"No such configuration item(s)" in l2vpn_out:
             l2vpn_out = connection.send_command("show run l2vpn xconnect group EPL")
-        l2vpn_split = l2vpn_out.splitlines()
-        l2vpn_configs.extend(l2vpn_split[2:-1])
+        l2vpn_configs += "\n".join(l2vpn_out.splitlines()[2:-1]) + "\n"
+
     if ela_circuit:
         bd_re = re.compile(r"(?:Bridge group:\s)(?<bgroup>[\w-_]+)(?:, bridge-domain: )(?<bdomain>[\w-_]+)")
         for port in service_ports:
@@ -691,37 +712,37 @@ def _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, el
             if "ELA" in port_desc:
                 bridge_dom_output = connection.send_command(
                     f"show l2vpn bridge-domain interface {port}"
-                    )
-                bridge_match = bd_re.search(bridge_dom_output)
-                bridge_group = bridge_match.group("bgroup")
-                bridge_dom = bridge_match.group("bdomain")
-                l2vpn_out = connection.send_command(
-                        f"show run l2vpn bridge group {bridge_group}"
-                    )
-                l2vpn_split = l2vpn_out.splitlines()
-                l2vpn_configs.extend(l2vpn_split[2:-1])
-    if voice_circuit:
-        vrf_out = connection.send_command("show run vrf VOICE")
-        vrf_split = vrf_out.splitlines()
-        voice_vrf.extend(vrf_split[2:-1])
-        bgp_out = connection.send_command("show run router bgp 15164 vrf VOICE")
-        bgp_split = bgp_out.splitlines()
-        voice_bgp.extend(bgp_split[2:-1])
-    
-    for line in voice_vrf:
-        service_configs += f"{line}\n"
-    for line in cfm_configs:
-        service_configs += f"{line}\n"
-    for line in p_map_configs:
-        service_configs += f"{line}\n"
-    for line in interface_configs:
-        service_configs += f"{line}\n"
-    for line in l2vpn_configs:
-        service_configs += f"{line}\n"
-    for line in voice_bgp:
-        service_configs += f"{line}\n"
+                )
+                if bridge_match := bd_re.search(bridge_dom_output):
+                    bridge_group = bridge_match["bgroup"]
+                    l2vpn_out = connection.send_command(
+                            f"show run l2vpn bridge group {bridge_group}"
+                        ).splitlines()[2:-1]
+                    l2vpn_configs += "\n".join(l2vpn_out) + "\n"
+    return l2vpn_configs
 
-    return service_configs
+
+def _xr_get_cfm_configs(connection, epl_circuit):
+    """Gets CFM configurations."""
+    if not epl_circuit:
+        return ""
+    return _get_xr_config_section(connection, "show run ethernet cfm domain UPN_L3 level 3")
+
+
+def _xr_get_voice_configs(connection, voice_circuit):
+    """Gets voice-related configurations."""
+
+    voice_configs = ""
+    if voice_circuit:
+        voice_configs += _get_xr_config_section(connection, "show run vrf VOICE")
+        voice_configs += _get_xr_config_section(connection, "show run router bgp 15164 vrf VOICE")
+    return voice_configs
+
+
+def _get_xr_config_section(connection, command):
+    """Gets a specific configuration section using the provided command."""
+    output = connection.send_command(command)
+    return "\n".join(output.splitlines()[2:-1]) + "\n"
 
 
 def _xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd):
@@ -775,7 +796,7 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
             dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
             _xr_parse_device_info(dev_id_out, platform, version, \
                 if_desc_output, ring_id, collect_CKIDs)
-        
+
         service_configs = _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
 
         if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
@@ -785,11 +806,7 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
 
         connection.disconnect()
 
-        if len(ring_ports) != 2:
-            ring_port2 = None
-        else:
-            ring_port2 = ring_ports[1]
-
+        ring_port2 = None if len(ring_ports) != 2 else ring_ports[1]
         return {
             "hostname": h_name,
             "router_id": router_id,
