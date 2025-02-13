@@ -31,19 +31,21 @@
 #   stops when it finds the previous router on one ring port and the first    #
 #   on the other ring port. The script gathers device hostnames, the loopback #
 #   IPs (or router ID), the device model, IOS version, ROMMON version, ring   #
-#   port interface IDs, P2P IPs on the ring ports, and neighbor IDs on the    #
-#   ring ports. It also gathers CKIDs for all services on each device except  #
-#   for the core/aggregate routers. Some information is output regularly to   #
-#   so the user doesn't assume the script stopped running as it can take      #
-#   up to 20 minutes or so for this script to complete on larger rings. Two   #
-#   files will be created with all the collected data sorted. The script will #
-#   not prompt you for a specific directory but you can change it by editing  #
-#   the save_directory variable near the bottom of the main function. Devices #
-#   will be listed in the order that they appear on the ring.                 #
+#   port interface IDs, P2P IPs on the ring ports, neighbor IDs on the ring   #
+#   ports, and service configs. It also gathers CKIDs for all services on     #
+#   each device except for the core/aggregate routers. Some information is    #
+#   output regularly so the user doesn't assume the script stopped running as #
+#   it can take up to 20 minutes or so for this script to complete on larger  #
+#   rings. Two files will be created with all the collected data sorted. The  #
+#   script will prompt you for a specific directory where the files will be   #
+#   saved. Devices will be listed in the order that they appear on the ring.  #
+#   The following file will be saved to the save directory:                   # 
+#   {ring_id}_Dev_Info.json                                                   #
+#   {ring_id}_configs.xlsx                                                    #
+#   The json has much of the same info but I plan to use it for creating      #
+#   a network drawing of the ring through another script.                     #
 #                                                                             #
 # To do:                                                                      #
-#   - I plan to add a function using pandas to create an excel file where all #
-#     the data will be well sorted.                                           #
 #   - Will add a function probably using VisioAutomation to create a diagram  #
 #     of the ring but might script that out seperately to avoid the need for  #
 #     Visio to be installed if a user doesn't have it or would prefer to map  #
@@ -880,7 +882,9 @@ def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, tem
 
     dev_count = 0
     all_dev_info = []
+    device_list = []
     ckid_full_list = []
+    config_list = []
 
     router = agg_router01
 
@@ -899,6 +903,26 @@ def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, tem
         if device_info:
             if device_info['ckid_list']:
                 ckid_full_list.extend(device_info.pop('ckid_list'))
+            if device_info['service_configs']:
+                conf_row = {
+                    "Hostname": device_info['hostname'],
+                    "A_Config": "",
+                    "A_Device": "",
+                    "Z_Config": device_info.pop('service_configs'),
+                    "Z_Device": "",
+                }
+                config_list.append(conf_row)
+            dev_row = {
+                "Hostname": device_info['hostname'],
+                "OLD_IP": device_info['router_id'],
+                "SR_IP": "",
+                "Chassis": device_info['chassis'],
+                "IOS_Version": device_info['ios_ver'],
+                "ROM_Version": device_info['rom_version'],
+                "Ring_Port1_IP": device_info['ring_if1']['if_ip'],
+                "Ring_Port2_IP": device_info['ring_if2']['if_ip'],
+            }
+            device_list.append(dev_row)
             all_dev_info.append(device_info)
             print_device_info(device_info)
 
@@ -906,7 +930,7 @@ def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, tem
         previous_router = router
         router = next_router
 
-    return all_dev_info, ckid_full_list, dev_count
+    return all_dev_info, device_list, config_list, ckid_full_list, dev_count
 
 
 def print_device_info(device_info):
@@ -935,19 +959,39 @@ def print_device_info(device_info):
         print(formatted_info)
 
 
-def save_data(save_directory, ring_id, all_dev_info, ckid_full_list):
+def save_data(save_directory, ring_id, all_dev_info, device_list, config_list, ckid_full_list):
     """Saves the collected data to files."""
 
     print(f"Creating and saving files to: {save_directory}")
     dev_file_path = save_directory / Path(f"{ring_id}_Dev_Info.json")
-    ckid_file_path = save_directory / Path(f"{ring_id}_CKIDs.txt")
+    excel_file_path = save_directory / Path(f"{ring_id}_configs.xlsx")
+
+    # Create a DataFrame for the Devices sheet
+    devices_df = pd.DataFrame(device_list,
+                              columns=["Hostname", "OLD_IP", "SR_IP", "Chassis",
+                                       "IOS_Version", "ROM_Version", "Ring_Port1_IP", "Ring_Port2_IP"])
+    
+    # Create a DataFrame for the CKID_List sheet with one column "CircuitID"
+    ckid_df = pd.DataFrame(ckid_full_list, columns=["CircuitID"])
+
+    # Create a DataFrame for the Service_Configs sheet
+    service_configs_df = pd.DataFrame(config_list, columns=["Hostname", "A_Config",
+                                                            "A_Device", "Z_Config", "Z_Device"])
+    
+    # Write the three sheets to the Excel file using pandas ExcelWriter
+    try:
+        with pd.ExcelWriter(excel_file_path, engine='openpyxl') as writer:
+            devices_df.to_excel(writer, sheet_name="Devices", index=False)
+            service_configs_df.to_excel(writer, sheet_name="Service_Configs", index=False)
+            ckid_df.to_excel(writer, sheet_name="CKID_List", index=False)
+    except Exception as e:
+        print("Error", f"Failed to create Excel file:\n{e}")
+        return
+    
+    print("Success", f"Excel file created successfully:\n{excel_file_path}")
 
     with dev_file_path.open('w') as f:
         json.dump(all_dev_info, f, indent=4)
-
-    with open(ckid_file_path, 'w') as f:
-        for item in ckid_full_list:
-            f.write(item + "\n")
 
     print("Circuit IDs:")
     for each_id in ckid_full_list:
@@ -984,11 +1028,11 @@ def main():
 
     print(f"Attempting to walk {ring_id} starting at {agg_router01}...")
 
-    all_dev_info, ckid_full_list, dev_count = _walk_ring(
+    all_dev_info, device_list, config_list, ckid_full_list, dev_count = _walk_ring(
         None, None, agg_router01, agg_router02, ring_id, templates_dir, core_ips
     )
 
-    save_data(save_directory, ring_id, all_dev_info, ckid_full_list)
+    save_data(save_directory, ring_id, all_dev_info, device_list, config_list, ckid_full_list)
 
     print(f"Number of devices on ring: {dev_count}")
     print("\n\nTime taken: ", datetime.now() - start_time)
