@@ -6,6 +6,8 @@
 # Dependencies:                                                               # 
 #   Python3.9 or higher                                                       #
 #   Netmiko                                                                   #
+#   openpyxl                                                                  #
+#   pandas                                                                    #
 # Script Description:                                                         #
 #   This Python script will walk the ring when provided IP(s) for the core    #
 #   router(s) and the name of the ring. If the ring aggregates on a single    #
@@ -446,7 +448,8 @@ def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
     for port in service_ports:
         port_desc = connection.send_command(f"show interface {port} description")
         if "ELA" in port_desc:
-            port_conf = connection.send_command(f"show bridge-domain | i {port}")
+            port_suffix = port[2:]
+            port_conf = connection.send_command(f"show bridge-domain | i {port_suffix}")
             if bd_number_search := bd_re.search(port_conf):
                 bd_number = bd_number_search[1]
             bridge_dom_output = connection.send_command(
