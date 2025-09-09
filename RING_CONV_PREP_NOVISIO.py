@@ -452,19 +452,23 @@ def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
             port_conf = connection.send_command(f"show bridge-domain | i {port_suffix}")
             if bd_number_search := bd_re.search(port_conf):
                 bd_number = bd_number_search[1]
-            bridge_dom_output = connection.send_command(
-                f"show run | s bridge-domain {bd_number}"
-            ).splitlines()
-            if vfi_name_match := vfi_re.search("\n".join(bridge_dom_output)):
-                vfi_name = vfi_name_match[1]
-                vfi_out = connection.send_command(
-                    f"show run | s l2vpn vfi context {vfi_name}"
+                bridge_dom_output = connection.send_command(
+                    f"show run | s bridge-domain {bd_number}"
                 ).splitlines()
+                if vfi_name_match := vfi_re.search("\n".join(bridge_dom_output)):
+                    vfi_name = vfi_name_match[1]
+                    vfi_out = connection.send_command(
+                        f"show run | s l2vpn vfi context {vfi_name}"
+                    ).splitlines()
 
-                for line in vfi_out:
-                    l2vpn_configs += f"{line}\n"
-                for line in bridge_dom_output:
-                    l2vpn_configs += f"{line}\n"
+                    for line in vfi_out:
+                        l2vpn_configs += f"{line}\n"
+                    for line in bridge_dom_output:
+                        l2vpn_configs += f"{line}\n"
+            # If the service port is not in the "show bridge-domain"
+            # output, then it treats the circuit like an EPL 
+            else:
+                l2vpn_configs = _xe_get_cfm_configs(connection, ela_circuit)
 
     return l2vpn_configs
 
