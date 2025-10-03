@@ -1,13 +1,16 @@
 #!/usr/bin/python3
 
 ###############################################################################
-#   ring_walk.py Ver 1.0                                                      #
+#   ring_walk.py Ver 2.0                                                      #
 #   Author: Adam Tafoya                                                       #
+#   Date: October 2025                                                        #
+#                                                                             #
 # Dependencies:                                                               # 
 #   Python3.9 or higher                                                       #
 #   Netmiko                                                                   #
 #   openpyxl                                                                  #
 #   pandas                                                                    #
+#                                                                             #
 # Script Description:                                                         #
 #   This Python script will walk the ring when provided IP(s) for the core    #
 #   router(s) and the name of the ring. If the ring aggregates on a single    #
@@ -37,7 +40,7 @@
 #   ports, and service configs. It also gathers CKIDs for all services on     #
 #   each device except for the core/aggregate routers. Some information is    #
 #   output regularly so the user doesn't assume the script stopped running as #
-#   it can take up to 20 minutes or so for this script to complete on larger  #
+#   it can take up to 30 minutes or so for this script to complete on larger  #
 #   rings. Two files will be created with all the collected data sorted. The  #
 #   script will prompt you for a specific directory where the files will be   #
 #   saved. Devices will be listed in the order that they appear on the ring.  #
@@ -140,9 +143,8 @@ def get_core_router_ips():
             continue
         router_core01 = r1
         break
-
     # Prompt for the second IP address.
-    # If the user does not enter anything, ask for confirmation.
+    # If the user does not enter anything, confirm the ring is a single hub configuration.
     while True:
         r2 = input("Enter the IP address of the second core router. "
                    "If both sides of the ring aggregate on the same device, just press enter: ").strip()
@@ -159,7 +161,6 @@ def get_core_router_ips():
             continue
         router_core02 = r2
         break
-
     return (router_core01, router_core02)
 
 
@@ -182,14 +183,12 @@ def get_ring_id():
     # Define patterns:
     moe_pattern = re.compile(r"^(?P<prefix>[A-Z]{4})-MOE-(?P<suffix>\d{2}(-P)?)$")
     coe_pattern = re.compile(r"^(?P<prefix>[A-Z]{4})-COE-(?P<suffix>\d{2}(-P)?)$")
-    
+    # Prompt the user until a valid MOE ring ID is entered.
     while True:
         ring_id_input = input("Enter the ring ID (format: AAAA-MOE-00): ").strip().upper()
-        
         # Check for valid MOE ring ID.
         if moe_pattern.fullmatch(ring_id_input):
             return ring_id_input
-        
         # Check if the user entered a COE ring ID.
         if coe_pattern.fullmatch(ring_id_input):
             print("This function is only designed for walking MOE rings and will not work for a COE ring.")
@@ -199,7 +198,6 @@ def get_ring_id():
             else:
                 # Allow the user to try entering a valid ring ID again.
                 continue
-        
         # If the format doesn't match either pattern.
         print("Invalid ring ID format. Please ensure it follows the format: AAAA-MOE-00 (e.g., TEMP-MOE-02).")
 
@@ -215,15 +213,16 @@ def guess_dev_type(ip):
     Returns:
         str: The best match device type based on the SSH connection.
     """
-
+    # Set up the device dictionary with connection parameters.
     device = {
         "device_type": "autodetect",
         "ip": ip,
         "username": username,
         "password": password,
     }
-
+    # Create an SSHDetect object and perform autodetection.
     guesser = SSHDetect(**device)
+    # Return the best match device type.
     return guesser.autodetect()
 
 
@@ -244,7 +243,7 @@ def device_connect(ip, device_type):
     the device dictionary and logging parameters. The connection object is
     then returned.
     """
-
+    # Set up the device dictionary with connection parameters.
     device = {
         "device_type": device_type,
         "ip": ip,
@@ -261,7 +260,7 @@ def device_connect(ip, device_type):
         "global_delay_factor": 2.0,
         "session_log_file_mode": "write",
     }
-
+    # Create and return the connection object with logging parameters.
     return ConnLogOnly(
         log_file="ring_walk.log",
         log_level=logging.DEBUG,
@@ -272,27 +271,28 @@ def device_connect(ip, device_type):
 
 def _get_ckids(connection):
     """Gets CKIDs from the device."""
-
+    # Commands to retrieve running config and voice routes
     sh_run_cmd = "show run"
     voice_cmd = r"show ip route vrf VOICE | i directly connected"
-
+    # Send commands to the device
     connection.send_command("terminal length 0")
     running_cfg = connection.send_command(sh_run_cmd, read_timeout=60)
     voice_check = connection.send_command(voice_cmd)
-
+    # Regex patterns to find CKIDs and voice white label IDs
     ckid_pattern = re.compile(r"([A-Z]{6}\w{2}[-/][A-Z]{3}\w{3}[-/][A-Z]{6}\w{2})")
     voice_pattern = re.compile(r"(?:description.*)(WL.?[0-9]{5})")
-
+    # Find all CKIDs and voice IDs in the running config
     ckids = ckid_pattern.findall(running_cfg)
+    # If voice circuits are present, find voice white label IDs
     if 'directly connected' in voice_check:
         ckids.extend(voice_pattern.findall(running_cfg))
     updated_list = [s.replace("-", "/") for s in ckids]
+    # Remove duplicates by converting to a set and back to a list
     return list(set(updated_list))
 
 
 def _xe_get_device_info(connection, ring_id, template_dir):
     """Gets device information for Cisco XE devices."""
-
     # Set textfsm template files and paths
     tmpl_files = {
         "platform": ("cisco_ios_show_platform_diag.textfsm", "plat_diag_tmpl_path"),
@@ -303,9 +303,9 @@ def _xe_get_device_info(connection, ring_id, template_dir):
         name: str(template_dir / Path(file))
         for name, (file, _) in tmpl_files.items()
     }
-
-    # Send commands and parse output
+    # Get hostname
     h_name = connection.find_prompt()[:-1]
+    # Send commands and parse output
     outputs = {
         name: connection.send_command(
             f"show {name} {'diag' if name == 'platform' else 'description' if name == 'interfaces' else ''}",
@@ -331,7 +331,6 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
         r"(?P<bandwidth>\d{1,5}M)[-_]"
         r"(?P<actname>\S+)"
     )
-
     # Initialize lists and flags
     ring_ports = []
     service_ports = []  # Will remain empty if collect_CKIDs is False
@@ -339,17 +338,14 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
     epl_circuit = False
     ela_circuit = False
     voice_circuit = False
-
     # Process each interface entry if it has a non-empty description.
     for if_line in outputs["interfaces"]:
         description = if_line.get("description", "")
         if not description:
             continue
-
         # Skip management interfaces
         if description == "MGT_UPS":
             continue
-
         # Check if the interface belongs to the ring
         if ring_id in description:
             ring_ports.append(if_line["port"])
@@ -366,18 +362,15 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
             else:
                 # If the regex doesn't match, assume this is a voice service.
                 voice_circuit = True
-
     # Validate that at least one ring port was found.
     if not ring_ports:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
-
     # Retrieve additional device information.
     plat_out = outputs["platform"]
     chassis = plat_out[0]["chassis_type"]
     firmware_version = plat_out[0]["firmware_version"]
     ver_out = outputs["version"]
     ios_ver = ver_out[0]["version"]
-
     # Return all collected values.
     return (
         chassis,
@@ -394,41 +387,40 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
 
 def _xe_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
     """Gets service configurations for Cisco XE devices."""
-
+    # Initialize service configurations string
     service_configs = "!\n"
     service_configs += _xe_get_voice_configs(connection, voice_circuit)
     service_configs += _xe_get_cfm_configs(connection, epl_circuit)
     service_configs += _xe_get_l2vpn_configs(connection, ela_circuit, service_ports)
     service_configs += _xe_get_interface_and_policy_map_configs(connection, service_ports)
-
     return service_configs
 
 
 def _xe_get_voice_configs(connection, voice_circuit):
     """Gets voice-related configurations."""
+    # If there are no voice circuits, return an empty string.
     if not voice_circuit:
         return ""
-
+    # Retrieve VRF and BGP configurations related to voice.
     vrf_out = connection.send_command("show run | s ip vrf VOICE").splitlines()
     bgp_out = f"!\n{connection.send_command('sh run vrf VOICE | s router bgp')}"
     bgp_split = bgp_out.splitlines()
-
+    # Combine the configurations into a single string.
     voice_configs = "".join(f"{line}\n" for line in vrf_out)
     for line in bgp_split:
         voice_configs += f"{line}\n"
-
     return voice_configs
 
 
 def _xe_get_cfm_configs(connection, epl_circuit):
     """Gets CFM configurations."""
-
+    # If there are no EPL circuits, return an empty string.
     if not epl_circuit:
         return ""
-
+    # Retrieve CFM and EVC configurations.
     cfm_out = connection.send_command("show run | s ethernet cfm").splitlines()
     evc_out = connection.send_command("show run | i ethernet evc").splitlines()
-
+    # Combine the configurations into a single string.
     cfm_configs = "".join(f"{line}\n" for line in cfm_out)
     for line in evc_out:
         cfm_configs += f"{line}\n"
@@ -437,21 +429,24 @@ def _xe_get_cfm_configs(connection, epl_circuit):
 
 def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
     """Gets L2VPN configurations."""
-
+    # If there are no ELA circuits, return an empty string.
     if not ela_circuit:
         return ""
-
+    # Initialize variables and compile regex patterns
     l2vpn_configs = ""
     bd_re = re.compile(r"\s*(\d+)\s+")
     vfi_re = re.compile(r"member\s+vfi\s+([A-Za-z0-9_-]+)")
-
     for port in service_ports:
         port_desc = connection.send_command(f"show interface {port} description")
+        # Check if the port description contains "ELA"
         if "ELA" in port_desc:
+            # Get the bridge domain number associated with the service port
             port_suffix = port[2:]
             port_conf = connection.send_command(f"show bridge-domain | i {port_suffix}")
+            # Check if the service port is in the "show bridge-domain" output
             if bd_number_search := bd_re.search(port_conf):
                 bd_number = bd_number_search[1]
+                # Get the bridge domain configuration and associated VFI context
                 bridge_dom_output = connection.send_command(
                     f"show run | s bridge-domain {bd_number}"
                 ).splitlines()
@@ -460,7 +455,7 @@ def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
                     vfi_out = connection.send_command(
                         f"show run | s l2vpn vfi context {vfi_name}"
                     ).splitlines()
-
+                    # Combine the configurations into a single string
                     for line in vfi_out:
                         l2vpn_configs += f"{line}\n"
                     for line in bridge_dom_output:
@@ -469,61 +464,65 @@ def _xe_get_l2vpn_configs(connection, ela_circuit, service_ports):
             # output, then it treats the circuit like an EPL 
             else:
                 l2vpn_configs = _xe_get_cfm_configs(connection, ela_circuit)
-
     return l2vpn_configs
 
 
 def _xe_get_interface_and_policy_map_configs(connection, service_ports):
     """Gets interface and policy map configurations."""
-
+    # Compile regex pattern for policy maps
     p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
     configs = ""
     if_configs = ""
     p_map_configs = ""
-
     for port in service_ports:
+        # Get interface configuration
         if_config = connection.send_command(f"show run interface {port}")
+        # Extract and format interface configuration lines
         if_conf_split = if_config.splitlines()[3:-1]
         for line in if_conf_split:
             if_configs += f"{line}\n"
+        # Find and get associated policy map configurations
         for p_map in p_map_re.findall(if_config):
             p_map_out = connection.send_command(f"show run policy-map {p_map}")
             p_map_split = p_map_out.splitlines()[3:-1]
             for line in p_map_split:
                 p_map_configs += f"{line}\n"
-        
+    # Combine and return the configurations
     return p_map_configs + if_configs
 
 def _xe_get_interface_info(connection, ring_ports):
     """Gets interface information for Cisco XE devices."""
-
+    # Commands to retrieve interface brief and OSPF neighbor information
     ip_if_cmd = "show ip interface brief"
     ospf_ne_cmd = "show ip ospf neighbor"
-
+    # Collect information for the first ring port
     ring_if1 = ring_ports[0]
     if_ip_out1 = connection.send_command(f"{ip_if_cmd} {ring_if1}")
     ospf_ne_out1 = connection.send_command(f"{ospf_ne_cmd} {ring_if1}")
+    # Handle the case where there is only one ring port
     if len(ring_ports) != 2:
         if_ip_out2 = None
         ospf_ne_out2 = None
     else:
+        # Collect information for the second ring port
         ring_if2 = ring_ports[1]
         if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2}")
         ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
+    # Get the loopback IP
     dev_id_out = connection.send_command(f"{ip_if_cmd} Lo0")
-
     return (dev_id_out, if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
 
 
 def _xe_parse_interface_info(dev_id_out, if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2):
     """Parses interface information for Cisco XE devices."""
-
+    # Define and compile regex patterns
     ip_regex = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
-
+    # Parse device information
     dev_id_match = ip_regex.findall(dev_id_out)
+    # Validate that exactly one loopback IP was found
     if len(dev_id_match) != 1:
         raise ValueError("Invalid router ID output.")
-
+    # Extract IPs and neighbors for the ring ports
     if1_ip = ip_regex.findall(if_ip_out1)[0]
     if1_neighbor = ip_regex.findall(ospf_ne_out1)[0]
     if if_ip_out2:
@@ -532,16 +531,15 @@ def _xe_parse_interface_info(dev_id_out, if_ip_out1, ospf_ne_out1, if_ip_out2, o
     else:
         if2_ip = None
         if2_neighbor = None
-
     return (dev_id_match[0], if1_ip, if1_neighbor, if2_ip, if2_neighbor)
 
 
 def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
     """Gets device information for Cisco XE devices."""
-
+    # Establish connection and gather information
     try:
         connection.establish_connection()
-
+        # Get and parse device information
         h_name, outputs = _xe_get_device_info(connection, ring_id, template_dir)
         chassis, ios_ver, rom_version, ring_ports, service_ports, \
             dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
@@ -551,10 +549,11 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         service_configs = _xe_get_service_conf(connection, service_ports, \
             dia_circuit, epl_circuit, ela_circuit, voice_circuit)
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
-
+        # Disconnect from the device
         connection.disconnect()
-
+        # Handle the case where there is only one ring port
         ring_port2 = None if len(ring_ports) != 2 else ring_ports[1]
+        # Return the collected information as a dictionary
         return {
             "hostname": h_name,
             "router_id": router_id,
@@ -574,7 +573,7 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
             "service_configs": service_configs,
             "ckid_list": circuit_ids,
         }
-
+    # Handle exceptions and return None on failure
     except Exception as e:
         print(e)
         return None
@@ -582,11 +581,9 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
 
 def _xr_get_device_info(connection, ring_id, template_dir):
     """Gets device information for Cisco XR devices."""
-
     # Set textfsm template paths
     if_desc_tmpl_file = Path("cisco_xr_show_interfaces_description.textfsm")
     if_desc_tmpl_path = str(template_dir / if_desc_tmpl_file)
-
     # Send commands and parse output
     h_name = connection.find_prompt()[:-1].split(":")[1]
     dev_id_out = connection.send_command("show router-id")
@@ -597,13 +594,11 @@ def _xr_get_device_info(connection, ring_id, template_dir):
         use_textfsm=True,
         textfsm_template=if_desc_tmpl_path
     )
-
     return (h_name, dev_id_out, platform, version, if_desc_output)
 
 
 def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id, collect_CKIDs=True):
     """Parses device information for Cisco XR devices."""
-
     # Define and compile regex patterns
     chassis_pattern = re.compile(r"(N540X?-[A26][C8Z][CZ1][48]?[CG]?-SYS-?[AD]?)")
     version_pattern = re.compile(r"(?:\s+Version\s+\:\s)(\d\.\d\.\d+)")
@@ -616,16 +611,14 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
         r"(?P<bandwidth>\d{1,5}M)[-_]"
         r"(?P<actname>\S+)"
     )
-
     # Parse device information
     dev_id_match = ip_regex.findall(dev_id_out)
     if len(dev_id_match) != 1:
         print(dev_id_match)
         raise ValueError("Invalid router ID output.")
-
+    # Extract device type and IOS version
     chassis = chassis_pattern.search(platform)[1]
     ios_ver = version_pattern.search(version)[1]
-
     # Initialize lists and flags
     ring_ports = []
     service_ports = []  # Will remain empty if collect_CKIDs is False
@@ -633,17 +626,14 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
     epl_circuit = False
     ela_circuit = False
     voice_circuit = False
-
     # Process each interface entry if it has a non-empty description.
     for if_line in if_desc_output:
         description = if_line.get("description", "")
         if not description:
             continue
-
         # Skip management interfaces
         if description == "MGT_UPS":
             continue
-
         # Check if the interface belongs to the ring
         if ring_id in description:
             ring_ports.append(if_line["interface"])
@@ -660,50 +650,48 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
             else:
                 # If the regex doesn't match, assume this is a voice service.
                 voice_circuit = True
-
     # Validate that no less than one ring port was found.
     if not ring_ports:
         raise ValueError("Device is either not on a ring or interface descriptions don't match.")
-
     return (dev_id_match[0], chassis, ios_ver, ring_ports, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
 
 
 def _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
     """Gets service configurations for Cisco XR devices."""
-
+    # Initialize service configurations string
     service_configs = "!\n"
     service_configs += _xr_get_cfm_configs(connection, epl_circuit)
     service_configs += _xr_get_interface_and_policy_map_configs(connection, service_ports)
     service_configs += _xr_get_l2vpn_configs(connection, dia_circuit, epl_circuit, ela_circuit, service_ports)
     service_configs += _xr_get_voice_configs(connection, voice_circuit)
-
     return service_configs
 
 
 def _xr_get_interface_and_policy_map_configs(connection, service_ports):
     """Gets policy-map configurations."""
-
+    # Compile regex pattern for policy maps
     p_map_re = re.compile(r"(?:service-policy \w{2,3}put )([SP]\d{1,5}M)")
     p_map_configs = ""
     interface_configs = ""
-
     for port in service_ports:
+        # Get interface configuration
         if_config = connection.send_command(f"show run interface {port}")
+        # Find and get associated policy map configurations
         for p_map in p_map_re.findall(if_config):
             p_map_out = connection.send_command(f"show run policy-map {p_map}").splitlines()[2:-1]
             for line in p_map_out:
                 p_map_configs += f"{line}\n"
             for line in if_config.splitlines()[2:-1]:
                 interface_configs += f"{line}\n"
-
+    # Combine and return the configurations
     return p_map_configs + interface_configs
 
 
 def _xr_get_l2vpn_configs(connection, dia_circuit, epl_circuit, ela_circuit, service_ports):
     """Gets L2VPN configurations."""
-
+    # Initialize L2VPN configurations string
     l2vpn_configs = ""
-
+    # Get configurations based on circuit types
     if dia_circuit:
         l2vpn_configs += _get_xr_config_section(connection, "show run l2vpn xconnect group DIA")
     if epl_circuit:
@@ -711,7 +699,6 @@ def _xr_get_l2vpn_configs(connection, dia_circuit, epl_circuit, ela_circuit, ser
         if r"No such configuration item(s)" in l2vpn_out:
             l2vpn_out = connection.send_command("show run l2vpn xconnect group EPL")
         l2vpn_configs += "\n".join(l2vpn_out.splitlines()[2:-1]) + "\n"
-
     if ela_circuit:
         bd_re = re.compile(r"(?:Bridge group:\s)(?<bgroup>[\w-_]+)(?:, bridge-domain: )(?<bdomain>[\w-_]+)")
         for port in service_ports:
@@ -738,9 +725,9 @@ def _xr_get_cfm_configs(connection, epl_circuit):
 
 def _xr_get_voice_configs(connection, voice_circuit):
     """Gets voice-related configurations."""
-
     voice_configs = ""
     if voice_circuit:
+        # Retrieve VRF and BGP configurations related to voice
         voice_configs += _get_xr_config_section(connection, "show run vrf VOICE")
         voice_configs += _get_xr_config_section(connection, "show run router bgp 15164 vrf VOICE")
     return voice_configs
@@ -754,66 +741,65 @@ def _get_xr_config_section(connection, command):
 
 def _xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd):
     """Gets interface information for Cisco XR devices."""
-
+    # Collect information for the first ring port
     ring_if1 = ring_ports[0]
     if_ip_out1 = connection.send_command(f"{ip_if_cmd} {ring_if1} brief")
     ospf_ne_out1 = connection.send_command(f"{ospf_ne_cmd} {ring_if1}")
+    # Handle the case where there is only one ring port
     if len(ring_ports) != 2:
         if_ip_out2 = None
         ospf_ne_out2 = None
     else:
+        # Collect information for the second ring port
         ring_if2 = ring_ports[1]
         if_ip_out2 = connection.send_command(f"{ip_if_cmd} {ring_if2} brief")
         ospf_ne_out2 = connection.send_command(f"{ospf_ne_cmd} {ring_if2}")
-    
     return (if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2)
 
 
 def _xr_parse_interface_info(if_ip_out1, ospf_ne_out1, if_ip_out2, ospf_ne_out2):
     """Parses interface information for Cisco XR devices."""
-
+    # Define and compile regex patterns
     ip_regex = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b")
-
+    # Extract IPs and neighbors for the ring ports
     if1_ip = ip_regex.findall(if_ip_out1)[0]
     if1_neighbor = ip_regex.findall(ospf_ne_out1)[0]
-    
     if if_ip_out2:
         if2_ip = ip_regex.findall(if_ip_out2)[0]
         if2_neighbor = ip_regex.findall(ospf_ne_out2)[0]
     else:
         if2_ip = None
         if2_neighbor = None
-
     return (if1_ip, if1_neighbor, if2_ip, if2_neighbor)
 
 
 def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
     """Gets device information for Cisco XR devices."""
-
+    # Commands to retrieve interface IPs and OSPF neighbor information
     ip_if_cmd = "show ip interface"
     ospf_ne_cmd = "show ip ospf neighbor"
-
     try:
+        # Establish connection and gather information
         connection.establish_connection()
-
+        # Get and parse device information
         h_name, dev_id_out, platform, version, if_desc_output = \
             _xr_get_device_info(connection, ring_id, template_dir)
-
         router_id, chassis, ios_ver, ring_ports, service_ports, \
             dia_circuit, epl_circuit, ela_circuit, voice_circuit = \
             _xr_parse_device_info(dev_id_out, platform, version, \
                 if_desc_output, ring_id, collect_CKIDs)
-
+        # Get service configurations
         service_configs = _xr_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit)
-
+        # Get interface IPs and neighbors
         if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xr_parse_interface_info(*_xr_get_interface_info(connection, ring_ports, ip_if_cmd, ospf_ne_cmd))
-
+        # Get CKIDs if required
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
-
+        # Disconnect from the device
         connection.disconnect()
-
+        # Handle the case where there is only one ring port
         ring_port2 = None if len(ring_ports) != 2 else ring_ports[1]
+        # Return the collected information as a dictionary
         return {
             "hostname": h_name,
             "router_id": router_id,
@@ -833,7 +819,7 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
             "service_configs": service_configs,
             "ckid_list": circuit_ids,
         }
-
+    # Handle exceptions and return None on failure
     except Exception as e:
         print(e)
         return None
@@ -841,12 +827,14 @@ def xr_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
 def _get_device_info(connection, ios_type, ring_id, templates_dir, collect_CKIDs):
     """Gets device information based on IOS type."""
     try:
+        # Call the appropriate function based on the IOS type
         if ios_type == "cisco_xe":
             return xe_device_info(connection, ring_id, templates_dir, collect_CKIDs)
         elif ios_type == "cisco_xr":
             return xr_device_info(connection, ring_id, templates_dir, collect_CKIDs)
         else:
             return None
+    # Handle exceptions and return None on failure
     except Exception as e:
         print(e)
         return None
@@ -854,7 +842,7 @@ def _get_device_info(connection, ios_type, ring_id, templates_dir, collect_CKIDs
 
 def _determine_next_router(device_info, previous_router, agg_router01, agg_router02, core_ips, router):
     """Determines the next router to connect to."""
-
+    # Logic to determine the next router based on device information and previous router
     if not previous_router:
         return (
             device_info['ring_if2']['neighbor']
@@ -862,7 +850,6 @@ def _determine_next_router(device_info, previous_router, agg_router01, agg_route
             and device_info['ring_if1']['neighbor'] == agg_router02
             else device_info['ring_if1']['neighbor'] if device_info else None
         )
-
     elif device_info and device_info['ring_if1']['neighbor'] == previous_router:
         return (
             None
@@ -875,7 +862,6 @@ def _determine_next_router(device_info, previous_router, agg_router01, agg_route
         )
     elif (router not in core_ips and device_info and device_info['ring_if1']['neighbor'] == agg_router01) or router in core_ips:
         return None
-
     elif device_info:
         return device_info['ring_if1']['neighbor']
     else:
@@ -884,30 +870,32 @@ def _determine_next_router(device_info, previous_router, agg_router01, agg_route
 
 def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, templates_dir, core_ips):
     """Walks the ring and gathers device information."""
-
+    # Initialize variables
     dev_count = 0
     all_dev_info = []
     device_list = []
     ckid_full_list = []
     config_list = []
-
     router = agg_router01
-
-    while router:  # Loop until no next router is found
+    # Loop until no next router is found
+    while router:
         collect_CKIDs = router not in core_ips
         if collect_CKIDs:
             dev_count += 1
-
         print("Figuring out device type and setting up connection...")
+        # Use guess_dev_type to determine the device type
         ios_type = guess_dev_type(router)
+        # Use device_connect to establish a connection to the device
         connection = device_connect(router, ios_type)
         print(f"Gathering device information ({router})...")
-
+        # use _get_device_info to gather device information for the current router
         device_info = _get_device_info(connection, ios_type, ring_id, templates_dir, collect_CKIDs)
-
+        # If device_info is None, skip to the next router
         if device_info:
+            # Append CKIDs to the full list if they exist
             if device_info['ckid_list']:
                 ckid_full_list.extend(device_info.pop('ckid_list'))
+            # Create a row for the service configurations if they exist
             if device_info['service_configs']:
                 conf_row = {
                     "Hostname": device_info['hostname'],
@@ -917,6 +905,7 @@ def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, tem
                     "Z_Device": "",
                 }
                 config_list.append(conf_row)
+            # Create a row for the device list
             dev_row = {
                 "Hostname": device_info['hostname'],
                 "OLD_IP": device_info['router_id'],
@@ -927,29 +916,31 @@ def _walk_ring(router, previous_router, agg_router01, agg_router02, ring_id, tem
                 "Ring_Port1_IP": device_info['ring_if1']['if_ip'],
                 "Ring_Port2_IP": device_info['ring_if2']['if_ip'],
             }
+            # Append device info to lists
             device_list.append(dev_row)
             all_dev_info.append(device_info)
             print_device_info(device_info)
-
+        # Use _determine_next_router to find the next router in the ring
         next_router = _determine_next_router(device_info, previous_router, agg_router01, agg_router02, core_ips, router)
+        # Update previous_router and router for the next iteration
         previous_router = router
         router = next_router
-
     return all_dev_info, device_list, config_list, ckid_full_list, dev_count
 
 
 def print_device_info(device_info):
     """Prints formatted device information."""
+    # Confirm device_info is not None
     if not device_info:
         return
-
+    # Define initial formatted string
     formatted_info = f"{device_info['hostname']} - " \
                      f"{device_info['router_id']} - " \
                      f"{device_info['chassis']} - " \
-                     f"{device_info['ios_ver']} - "
-
+                     f"{device_info['ios_ver']}"
+    # Add ROM version if it exists and apply color coding based on conditions
     if device_info['rom_version']:
-        formatted_info += f"{device_info['rom_version']}"
+        formatted_info += f" - {device_info['rom_version']}"
         if "901" in device_info['chassis'] \
             or "903" in device_info['chassis']:
             print_red(formatted_info)
@@ -965,80 +956,81 @@ def print_device_info(device_info):
 
 
 def save_data(save_directory, ring_id, all_dev_info, device_list, config_list, ckid_full_list):
-    """Saves the collected data to files."""
-
+    """
+    Saves the collected data to two different files and prints out circuit IDs.
+    1. A JSON file containing all device information for use in creating Visio diagrams.
+    2. An Excel file with three sheets: Devices, Service_Configs, and CKID_List.
+    """
     print(f"Creating and saving files to: {save_directory}")
     dev_file_path = save_directory / Path(f"{ring_id}_Dev_Info.json")
     excel_file_path = save_directory / Path(f"{ring_id}_configs.xlsx")
-
     # Create a DataFrame for the Devices sheet
     devices_df = pd.DataFrame(device_list,
                               columns=["Hostname", "OLD_IP", "SR_IP", "Chassis",
                                        "IOS_Version", "ROM_Version", "Ring_Port1_IP", "Ring_Port2_IP"])
-    
     # Create a DataFrame for the CKID_List sheet with one column "CircuitID"
     ckid_df = pd.DataFrame(ckid_full_list, columns=["CircuitID"])
-
     # Create a DataFrame for the Service_Configs sheet
     service_configs_df = pd.DataFrame(config_list, columns=["Hostname", "A_Config",
                                                             "A_Device", "Z_Config", "Z_Device"])
-    
     # Write the three sheets to the Excel file using pandas ExcelWriter
     try:
         with pd.ExcelWriter(excel_file_path, engine='openpyxl') as writer:
             devices_df.to_excel(writer, sheet_name="Devices", index=False)
             service_configs_df.to_excel(writer, sheet_name="Service_Configs", index=False)
             ckid_df.to_excel(writer, sheet_name="CKID_List", index=False)
+            print(f"Excel file created successfully:\n{excel_file_path}")
     except Exception as e:
         print("Error", f"Failed to create Excel file:\n{e}")
         return
-    
-    print("Success", f"Excel file created successfully:\n{excel_file_path}")
-
+    # Save the device information to a JSON file for use in creating visio diagrams
     with dev_file_path.open('w') as f:
         json.dump(all_dev_info, f, indent=4)
-
+    # Print out the circuit IDs
     print("Circuit IDs:")
     for each_id in ckid_full_list:
         print(each_id)
 
 
 def main():
+    # Set credentials as global variables
     global username
     global password
-
+    # Prompt for username and password
     print("Enter your username:")
     username = input("Username: ")
     print("Enter your password:")
     password = getpass()
-
+    # Get core router IPs and ring ID
     core_ips = get_core_router_ips()
     ring_id = get_ring_id()
-
+    # Get the directory of the templates used for textfsm parsing
     spec = find_spec("ntc_templates")
     templates_dir = Path(spec.submodule_search_locations[0]) / Path("templates")
-
+    # Set aggregation router variables
     agg_router01 = core_ips[0]
     agg_router02 = core_ips[1] or core_ips[0]
-
+    # Print initial information
     print("Dual Hub Ring" if core_ips[1] else "Single Hub Ring")
     print(f"Agg 1: {agg_router01}")
     if core_ips[1]:
         print(f"Agg 2: {agg_router02}")
-
+    # Prompt user to select a directory for saving files
     input("Press enter to open a dialog box and choose a folder for saving device and circuit ID files...")
-    save_directory = Path(get_dir_path())
-
+    parent_directory = Path(get_dir_path())
+    # Create a subdirectory using the ring ID
+    save_directory = parent_directory / Path(ring_id)
+    save_directory.mkdir(parents=True, exist_ok=True)
+    # Start the timer
     start_time = datetime.now()
-
+    # Walk the ring and gather device information
     print(f"Attempting to walk {ring_id} starting at {agg_router01}...")
-
     all_dev_info, device_list, config_list, ckid_full_list, dev_count = _walk_ring(
         None, None, agg_router01, agg_router02, ring_id, templates_dir, core_ips
     )
-
+    # Save the collected data to files
     save_data(save_directory, ring_id, all_dev_info, device_list, config_list, ckid_full_list)
-
+    # Print summary information
     print(f"Number of devices on ring: {dev_count}")
     print("\n\nTime taken: ", datetime.now() - start_time)
 
