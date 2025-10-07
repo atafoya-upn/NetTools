@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 ###############################################################################
-#   ring_walk.py Ver 2.0                                                      #
+#   RING_CONV_PREP_NOVISIO.py Ver 3.0                                                      #
 #   Author: Adam Tafoya                                                       #
 #   Date: October 2025                                                        #
 #                                                                             #
@@ -44,11 +44,17 @@
 #   rings. Two files will be created with all the collected data sorted. The  #
 #   script will prompt you for a specific directory where the files will be   #
 #   saved. Devices will be listed in the order that they appear on the ring.  #
-#   The following file will be saved to the save directory:                   # 
+#   The following files will be saved to the save directory:                  # 
 #   {ring_id}_Dev_Info.json                                                   #
 #   {ring_id}_configs.xlsx                                                    #
 #   The json has much of the same info but I plan to use it for creating      #
-#   a network drawing of the ring through another script.                     #
+#   a network drawing of the ring through another script in the future.       #
+#   The excel file has a tab for device info and a tab for service configs.   #
+#                                                                             #
+#   What's new in Ver 3.0:                                                    #
+#   - Added a function to ensure required packages are installed.             #
+#   - Added a function to get device credentials with precedence for PROD     #
+#     environment variables.                                                  #
 #                                                                             #
 # To do:                                                                      #
 #   - Will add a function probably using VisioAutomation to create a diagram  #
@@ -59,8 +65,9 @@
 
 import re
 import sys
+import os
+from typing import Tuple
 from getpass import getpass
-from netmiko import SSHDetect, ConnLogOnly
 from datetime import datetime
 import logging
 import ipaddress
@@ -69,10 +76,114 @@ from importlib.util import find_spec
 import json
 import tkinter as tk
 from tkinter import filedialog
-import pandas as pd
+import subprocess
+from importlib import metadata
 
-if sys.version_info < (3, 9):
-    sys.exit("This script requires Python 3.9 or higher!")
+# Ensure required packages are installed
+# Map: import_name -> pip_name
+REQUIRED_PACKAGES = {
+    "dotenv": "python-dotenv",
+    "pandas": "pandas",
+    "netmiko": "netmiko",
+}
+
+def _is_installed(import_name: str) -> bool:
+    return find_spec(import_name) is not None
+
+
+def _installed_version(pip_name: str) -> str:
+    try:
+        return metadata.version(pip_name)
+    except metadata.PackageNotFoundError:
+        return ""
+
+
+def _pip_install(*args: str) -> int:
+    # Use the same interpreter that's running this script
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+    cmd += list(args)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Print output only on non-zero exit to aid debugging
+    if proc.returncode != 0:
+        print(proc.stdout)
+    return proc.returncode
+
+
+def ensure_dependencies(requirements: dict = REQUIRED_PACKAGES) -> None:
+    missing = [imp for imp in requirements if not _is_installed(imp)]
+    if not missing:
+        return
+    # Install missing by their pip names
+    to_install = [requirements[imp] for imp in missing]
+    rc = _pip_install(*to_install)
+    if rc != 0:
+        raise SystemExit(
+            "Failed to install required packages: "
+            + ", ".join(to_install)
+            + "\nTip: run with admin/venv privileges or install manually using:\n"
+            + f"{sys.executable} -m pip install " + " ".join(to_install)
+        )
+    # Verify imports now work
+    still_missing = [imp for imp in requirements if not _is_installed(imp)]
+    if still_missing:
+        details = []
+        for imp in still_missing:
+            pipn = requirements[imp]
+            details.append(f"{imp} (pip name: {pipn}, version seen: '{_installed_version(pipn) or 'not found'}')")
+        raise SystemExit(
+            "Packages were installed but imports still failed (interpreter mismatch?).\n"
+            + "\n".join(details)
+            + "\nMake sure you installed into the SAME interpreter:\n"
+            + f"{sys.executable} -m pip show python-dotenv pandas netmiko"
+        )
+
+
+def get_device_credentials() -> Tuple[str, str]:
+    """
+    Resolve device login credentials for PRODUCTION use.
+
+    Order of precedence:
+      1) DEVICE_USERNAME_PROD + DEVICE_PASSWORD_PROD (from .env)
+      2) DEVICE_USERNAME + DEVICE_PASSWORD (from .env)
+      3) Prompt the user (loops until both are non-empty)
+
+    Returns:
+        (username, password)
+    """
+    # Load .env file if it exists
+    load_dotenv()
+
+    def _val(key: str) -> str:
+        v = os.getenv(key)
+        return v.strip() if v and v.strip() else ""
+
+    # 1) Production-specific creds
+    prod_user = _val("DEVICE_USERNAME_PROD")
+    prod_pass = _val("DEVICE_PASSWORD_PROD")
+    if prod_user and prod_pass:
+        return prod_user, prod_pass
+
+    # 2) Generic creds
+    gen_user = _val("DEVICE_USERNAME")
+    gen_pass = _val("DEVICE_PASSWORD")
+    if gen_user and gen_pass:
+        return gen_user, gen_pass
+
+    # 3) Prompt until non-empty
+    while True:
+        print("Enter your username:")
+        username = input("Username: ").strip()
+        if not username:
+            print("Username must not be empty. Please try again.\n")
+            continue
+
+        print("Enter your password:")
+        password = getpass().strip()
+        if not password:
+            print("Password must not be empty. Please try again.\n")
+            continue
+
+        return username, password
 
 
 def print_red(message: str) -> None:
@@ -997,10 +1108,7 @@ def main():
     global username
     global password
     # Prompt for username and password
-    print("Enter your username:")
-    username = input("Username: ")
-    print("Enter your password:")
-    password = getpass()
+    username, password = get_device_credentials()
     # Get core router IPs and ring ID
     core_ips = get_core_router_ips()
     ring_id = get_ring_id()
@@ -1036,4 +1144,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Ensure python 3.9 or higher is installed
+    if sys.version_info.major != 3 and sys.version_info.minor >= 9:
+        print(
+            "Your Python version is outdated and may not be compatible with this "
+            "script."
+        )
+        print("Please consider updating Python to version 3.9 or later.")
+        print(
+            "You can download the latest version from: "
+            "https://www.python.org/downloads/"
+        )
+        sys.exit(1)
+    ensure_dependencies()  # ensures dotenv, pandas, netmiko exist
+    from netmiko import SSHDetect, ConnLogOnly
+    from dotenv import load_dotenv
+    import pandas as pd
+    raise SystemExit(main())
