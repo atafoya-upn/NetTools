@@ -88,8 +88,8 @@ python RING_CONV_PREP_NOVISIO.py
 
 ## 👨‍💻 Contributors
 
-- **Adam Tafoya** — Lead Developer  
-- **Scott Hensley** — Contributor (SR Conversion Prep Project)
+- **Adam Tafoya**  
+- **Scott Hensley**
 
 ---
 
