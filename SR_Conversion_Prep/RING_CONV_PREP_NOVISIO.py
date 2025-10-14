@@ -390,7 +390,7 @@ def _get_ckids(connection):
     running_cfg = connection.send_command(sh_run_cmd, read_timeout=60)
     voice_check = connection.send_command(voice_cmd)
     # Regex patterns to find CKIDs and voice white label IDs
-    ckid_pattern = re.compile(r"([A-Z]{6}\w{2}[-/][A-Z]{3}\w{3}[-/][A-Z]{6}\w{2})")
+    ckid_pattern = re.compile(r"([A-Z]{6}\w{2}[-/][A-Z]{3}\w{3,4}[-/][A-Z]{6}\w{2})")
     voice_pattern = re.compile(r"(?:description.*)(WL.?[0-9]{5})")
     # Find all CKIDs and voice IDs in the running config
     ckids = ckid_pattern.findall(running_cfg)
@@ -437,7 +437,7 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
     # Compile the regex for service descriptions
     serv_des_re = re.compile(
         r"(?P<aloc>[A-Z]{6}\w{2})/"
-        r"(?P<circuitid>[A-Z]{3}\w{3})/"
+        r"(?P<circuitid>[A-Z]{3}\w{3,4})/"
         r"(?P<zloc>[A-Z]{6}\w{2})[-_]"
         r"(?P<bandwidth>\d{1,5}M)[-_]"
         r"(?P<actname>\S+)"
@@ -455,7 +455,7 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
         if not description:
             continue
         # Skip management interfaces
-        if description == "MGT_UPS":
+        if description == "MGT_UPS" or description == "_LOOP_, MANAGEMENT IP - Inband":
             continue
         # Check if the interface belongs to the ring
         if ring_id in description:
@@ -496,7 +496,7 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
     )
 
 
-def _xe_get_service_conf(connection, service_ports, dia_circuit, epl_circuit, ela_circuit, voice_circuit):
+def _xe_get_service_conf(connection, service_ports, epl_circuit, ela_circuit, voice_circuit):
     """Gets service configurations for Cisco XE devices."""
     # Initialize service configurations string
     service_configs = "!\n"
@@ -658,7 +658,7 @@ def xe_device_info(connection, ring_id, template_dir, collect_CKIDs=True):
         router_id, if1_ip, if1_neighbor, if2_ip, if2_neighbor = \
             _xe_parse_interface_info(*_xe_get_interface_info(connection, ring_ports))
         service_configs = _xe_get_service_conf(connection, service_ports, \
-            dia_circuit, epl_circuit, ela_circuit, voice_circuit)
+            epl_circuit, ela_circuit, voice_circuit)
         circuit_ids = _get_ckids(connection) if collect_CKIDs else []
         # Disconnect from the device
         connection.disconnect()
@@ -717,7 +717,7 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
     # Compile the regex for service descriptions
     serv_des_re = re.compile(
         r"(?P<aloc>[A-Z]{6}\w{2})/"
-        r"(?P<circuitid>[A-Z]{3}\w{3})/"
+        r"(?P<circuitid>[A-Z]{3}\w{3,4})/"
         r"(?P<zloc>[A-Z]{6}\w{2})[-_]"
         r"(?P<bandwidth>\d{1,5}M)[-_]"
         r"(?P<actname>\S+)"
@@ -743,7 +743,7 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
         if not description:
             continue
         # Skip management interfaces
-        if description == "MGT_UPS":
+        if description == "MGT_UPS" or description == "_LOOP_, MANAGEMENT IP - Inband":
             continue
         # Check if the interface belongs to the ring
         if ring_id in description:
