@@ -455,7 +455,9 @@ def _xe_parse_device_info(outputs, ring_id, collect_CKIDs=True):
         if not description:
             continue
         # Skip management interfaces
-        if description == "MGT_UPS" or description == "_LOOP_, MANAGEMENT IP - Inband":
+        if description == "MGT_UPS":
+            continue
+        if description == r"_LOOP_, MANAGEMENT IP - Inband":
             continue
         # Check if the interface belongs to the ring
         if ring_id in description:
@@ -743,7 +745,9 @@ def _xr_parse_device_info(dev_id_out, platform, version, if_desc_output, ring_id
         if not description:
             continue
         # Skip management interfaces
-        if description == "MGT_UPS" or description == "_LOOP_, MANAGEMENT IP - Inband":
+        if description == "MGT_UPS":
+            continue
+        if description == r"_LOOP_, MANAGEMENT IP - Inband":
             continue
         # Check if the interface belongs to the ring
         if ring_id in description:
